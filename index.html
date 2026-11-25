@@ -2556,6 +2556,7 @@ const FN_API = 'https://hashtag.web.id';
 const SNAP_HOME = 'https://cdn.jsdelivr.net/gh/alireza-spec/FN@main/snapshot/home.json';
 const DL_BASE = 'https://alireza-spec.github.io/family-night-site/download-data/';
 const OLD_DL_BASE = DL_BASE + 'old/'; /* fallback: old FN archive, used only when a title is NOT in the new Zivarnet archive */
+const DL_PROXY = FN_API + '/v1/dl/'; /* FN-DL-PROXY v1 (no-VPN boxes): worker route for download-data — github.io stalls without VPN from Iran, the worker fetches it server-side */
 const TV_PROXY = 'https://iran-tv-proxy-v3.alirezadoe8.workers.dev/proxy?url=';
 /* FN-POSTER-SPEED v1 (test repo only): display-size TMDB images + lazy/decoding on poster imgs */
   const IMG = (p, s) => p ? FN_API + '/img/' + (s || 'w500') + p : '';
@@ -2660,6 +2661,23 @@ async function fnFetchResilient(url, opts, timeoutMs, attempts, parse) {
     finally { if (timer) clearTimeout(timer); }
   }
   throw lastErr || new Error('fetch failed');
+}
+/* FN-DL-PROXY v1 (2026-11-25, no-VPN boxes): every download-box / play-box
+   fetch used to hit DL_BASE (github.io Pages) directly, and a stalled
+   connection there never settled — bare fetch() has no timeout, so the
+   boxes spun forever. The worker route /v1/dl/<relpath> fetches the same
+   files server-side (fast egress, 5-min cache, stale-on-error) and the
+   browser tries it FIRST; any failure falls back to a direct DL_BASE
+   fetch (fail-open — never worse than today). timeoutMs/attempts are
+   per-leg fnFetchResilient budgets (default 8000 ms x 2). */
+async function fnDlFetch(path, parse, timeoutMs, attempts) {
+  var rel = String(path || '').replace(/^\/+/, '');
+  var to = timeoutMs || 8000, at = attempts || 2;
+  try {
+    return await fnFetchResilient(DL_PROXY + rel, {}, to, at, parse);
+  } catch (e) {
+    return await fnFetchResilient(DL_BASE + rel, {}, to, at, parse);
+  }
 }
 const apiCache = new Map();
 async function fnApiJson(fullUrl) {
@@ -4202,6 +4220,7 @@ function fnPaintHome(rows) {
   else { fnPaintHomeRailsDelta(rows); }
   _fnHomePrevRows = fnSnapRows(rows);
   try { fnRailsCacheSave(rows, (typeof heroItems !== 'undefined') ? heroItems : []); } catch (e) {}
+  try { fnDlIconApply(); } catch (e) {} /* FN-DL-ICON v2: cards painted early get their badge whenever the avail-index lands */
 }
 function fnPaintHomeRailsDelta(rows) {
   var railsEl = document.querySelector('#home-rails');
@@ -4314,6 +4333,7 @@ function paintHomeRails(rows) {
     const slice = railKeys.slice(railIx, railIx + 6);
     railIx += slice.length;
     if (slice.length) sentinel.insertAdjacentHTML('beforebegin', slice.map(k => railHtml(k, rows[k])).join(''));
+    try { fnDlIconApply(); } catch (e) {} /* FN-DL-ICON v2: progressive batches get their badges too */
     if (railIx >= railKeys.length) sentinel.remove();
   };
   paintMoreRails();
@@ -4896,18 +4916,26 @@ $$('#genre-chips [data-gchip]').forEach(b => b.onclick = () => openArchive({ tit
    link. Non-category listings (collection parts, calendar day, person
    filmography) keep the old call without strict50 and still release
    everything at the end. */
-var FN_AVAIL = { idx: null, loading: null, loaded: false, failed: false };
+var FN_AVAIL = { idx: null, loading: null, loaded: false, failed: false, retryAt: 0, retryTimer: null };
+/* FN-DL-ICON v2 (2026-11-25, no-VPN): the 7.1 MB avail-index used to get ONE
+   5 s attempt — on a phone link it aborted before the body arrived, the
+   failure was silent and no home visit ever retried, so cards kept no
+   badge. Now: 15 s x 2 per leg via the worker proxy (fnDlFetch), and a
+   background retry loop with backoff (5 s, 15 s, 45 s, then every 120 s)
+   until it loads — every success patches the badges via fnDlIconApply. */
 function fnAvailEnsure() {
   if (FN_AVAIL.loaded) return Promise.resolve(FN_AVAIL.idx);
   if (FN_AVAIL.loading) return FN_AVAIL.loading;
-  var url = (typeof DL_BASE !== 'undefined' ? DL_BASE : '') + 'avail-index.json';
-  var ctl = null;
-  try { ctl = new AbortController(); setTimeout(function () { try { ctl.abort(); } catch (e) {} }, 5000); } catch (e) { ctl = null; }
-  FN_AVAIL.loading = fetch(url, ctl ? { signal: ctl.signal } : {})
-    .then(function (r) { if (!r.ok) throw new Error('avail ' + r.status); return r.json(); })
-    .then(function (j) { FN_AVAIL.idx = j || null; FN_AVAIL.loaded = true; try { fnDlIconApply(); } catch (e) {} return FN_AVAIL.idx; })
-    .catch(function () { FN_AVAIL.failed = true; FN_AVAIL.loading = null; return null; });
+  FN_AVAIL.loading = fnDlFetch('avail-index.json', 'json', 15000, 2)
+    .then(function (j) { FN_AVAIL.idx = j || null; FN_AVAIL.loaded = true; FN_AVAIL.failed = false; try { fnDlIconApply(); } catch (e) {} return FN_AVAIL.idx; })
+    .catch(function () { FN_AVAIL.failed = true; FN_AVAIL.loading = null; fnAvailRetrySoon(); return null; });
   return FN_AVAIL.loading;
+}
+function fnAvailRetrySoon() {
+  if (FN_AVAIL.loaded || FN_AVAIL.retryTimer) return;
+  var d = FN_AVAIL.retryAt || 5000;
+  FN_AVAIL.retryAt = Math.min(d * 3, 120000);
+  FN_AVAIL.retryTimer = setTimeout(function () { FN_AVAIL.retryTimer = null; if (!FN_AVAIL.loaded) fnAvailEnsure(); }, d);
 }
 /* ---------- avail-index tmdb lookup: TYPE-AWARE (FN-ICON-COLLISION) ----------
    TMDB movie ids and TV ids share the same number space (movie 1701 =
@@ -6127,16 +6155,9 @@ function castPanelHtml(credits) {
   if (directors.length) out += '<div class="sec"><h2>کارگردان</h2><div class="castgrid">' + directors.map(p => personCard(p, 'کارگردان')).join('') + '</div></div>';
   return out;
 }
-function trailerPanelHtml(videos) {
-  const yt = (videos || []).filter(v => v.site === 'YouTube' && v.key);
-  if (!yt.length) return '<div class="state">تریلری برای این اثر در TMDB ثبت نشده است.</div>';
-  const rank = { Trailer: 0, Teaser: 1, Clip: 2, Featurette: 3 };
-  yt.sort((a, b) => (rank[a.type] != null ? rank[a.type] : 4) - (rank[b.type] != null ? rank[b.type] : 4));
-  return '<div class="trl">' + yt.map(v =>
-    '<button class="trl-card" data-yt="' + esc(v.key) + '"><span class="th"><img loading="lazy" src="https://img.youtube.com/vi/' + esc(v.key) + '/mqdefault.jpg" alt="">'
-    + '<span class="pl"><span><svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg></span></span></span>'
-    + '<span class="ti"><span>' + (v.type === 'Trailer' ? 'تریلر رسمی' : v.type === 'Teaser' ? 'تیزر' : v.type === 'Clip' ? 'کلیپ' : esc(v.type || 'ویدیو')) + (v.official ? ' · رسمی' : '') + '</span><b>' + esc(v.name || '') + '</b></span></button>').join('') + '</div>';
-}
+/* FN-TRAILER-NOVPN v1: trailerPanelHtml was dead code — no callers left
+   (the top «تریلر» button plays the best video directly via openTrailer)
+   — and its YouTube thumbnails never load without VPN. Deleted 2026-11-25. */
 function galleryPanelHtml(images, fallback) {
   /* ALL backdrops and posters of the title — the complete gallery,
      like the Family Night app (no truncation). */
@@ -6511,7 +6532,11 @@ function wireDetailSheet(o, itemForWl) {
     } catch (e) {}
     let vids = (o.videos || []).filter(v => v.site === 'YouTube' && v.key);
     if (!vids.length) {
-      try { const v = await tmdb(o.type + '/' + o.id + '/videos', {}, 'en-US'); o.videos = (v && v.results) || []; vids = o.videos.filter(x => x.site === 'YouTube' && x.key); } catch (e) {}
+      /* FN-TRAILER-NOVPN v1: on the local-detail path the videos hydrate
+         already failed (o._videosFailed) — do not refetch for ~26 s of
+         retries; toast at once. */
+      if (o._videosFailed) { toast('تریلری برای این اثر پیدا نشد'); return; }
+      try { const v = await tmdb(o.type + '/' + o.id + '/videos', {}, 'en-US'); o.videos = (v && v.results) || []; vids = o.videos.filter(x => x.site === 'YouTube' && x.key); } catch (e) { o._videosFailed = true; }
     }
     if (!vids.length) { toast('تریلری برای این اثر پیدا نشد'); return; }
     const rank = { Trailer: 0, Teaser: 1, Clip: 2, Featurette: 3 };
@@ -6794,8 +6819,10 @@ async function hydrateLocalDetail(type, id, token, item, o) {
     if (alive()) $('#d-panel-cast').innerHTML = '<div class="state">دریافت فهرست بازیگران و عوامل در حال حاضر ممکن نشد.</div>';
   });
   /* videos are only cached on o — the top «تریلر» button plays the
-     best one directly (and refetches on tap if this came back empty) */
-  tmdb(type + '/' + id + '/videos', {}, 'en-US').then(v => { if (alive()) o.videos = (v && v.results) || []; }).catch(() => {});
+     best one directly (and refetches on tap if this came back empty).
+     FN-TRAILER-NOVPN v1: a failed hydrate sets o._videosFailed, so a
+     tap toasts at once instead of refetching for ~26 s of retries. */
+  tmdb(type + '/' + id + '/videos', {}, 'en-US').then(v => { if (alive()) o.videos = (v && v.results) || []; }).catch(() => { o._videosFailed = true; });
   tmdb(type + '/' + id + '/images', { include_image_language: 'en,null' }).then(im => { if (alive()) $('#d-panel-gallery').innerHTML = galleryPanelHtml(im, { backdrop: item.backdrop_path, poster: item.poster_path }); }).catch(() => {
     if (alive()) $('#d-panel-gallery').innerHTML = galleryPanelHtml(null, { backdrop: item.backdrop_path, poster: item.poster_path });
   });
@@ -6947,10 +6974,35 @@ async function loadDetailEpisodes(d, token) {
   box.querySelectorAll('[data-season]').forEach(b => b.onclick = () => loadSeason(+b.dataset.season));
   loadSeason(seasons[0].season_number);
 }
-function openTrailer(ytKey) {
+function fnYtThumbOk(ytKey) {
+  /* FN-TRAILER-NOVPN v1: probe YouTube reachability with the thumbnail
+     image (4 s cap). An <img> load proves the host answers from this
+     network; a failure means the embed would be a blank modal. */
+  return new Promise(function (res) {
+    var img = new Image();
+    var done = false;
+    var to = setTimeout(function () { if (!done) { done = true; try { img.src = ''; } catch (e) {} res(false); } }, 4000);
+    img.onload = function () { if (!done) { done = true; clearTimeout(to); res(true); } };
+    img.onerror = function () { if (!done) { done = true; clearTimeout(to); res(false); } };
+    img.src = 'https://img.youtube.com/vi/' + encodeURIComponent(ytKey) + '/mqdefault.jpg';
+  });
+}
+async function openTrailer(ytKey) {
   /* trailer subtitles follow the same rule as every other playback:
      Persian captions by default, English when Persian is unavailable
      (YouTube's cc_lang_pref does exactly that fallback itself) */
+  /* FN-TRAILER-NOVPN v1: YouTube is unreachable from some networks, and
+     the old code opened a blank iframe with no feedback. Probe first;
+     on failure show the honest unavailable state — never a blank iframe,
+     never an infinite spinner. Titles in dn-trailer-index.json never
+     reach here (their direct-mp4 trailer plays instead). */
+  var ok = false;
+  try { ok = await fnYtThumbOk(ytKey); } catch (e) { ok = false; }
+  if (!ok) {
+    $('#trailer-frame').innerHTML = '<div class="state" style="padding:2rem 1rem">تریلری برای این اثر پیدا نشد</div>';
+    $('#ov-trailer').classList.add('on');
+    return;
+  }
   $('#trailer-frame').innerHTML = '<iframe src="https://www.youtube.com/embed/' + encodeURIComponent(ytKey) + '?autoplay=1&rel=0&cc_load_policy=1&cc_lang_pref=fa&hl=fa" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen title="تریلر"></iframe>';
   $('#ov-trailer').classList.add('on');
 }
@@ -7083,12 +7135,12 @@ let fnDlIndex = null, fnDlIndexPromise = null; const fnDlParts = {}; const aoDlP
 let oldDlIndex = null, oldDlIndexPromise = null; const oldDlParts = {};
 function getOldDlIndex() {
   if (oldDlIndex) return Promise.resolve(oldDlIndex);
-  if (!oldDlIndexPromise) oldDlIndexPromise = fetch(OLD_DL_BASE + 'download-index.json').then(r => { if (!r.ok) throw new Error('old index'); return r.json(); }).then(x => { oldDlIndex = x || {}; return oldDlIndex; });
+  if (!oldDlIndexPromise) oldDlIndexPromise = fnDlFetch('old/download-index.json', 'json').then(x => { oldDlIndex = x || {}; return oldDlIndex; }).catch(e => { oldDlIndexPromise = null; throw e; }); /* FN-DL-NOVPN v1: was a bare fetch() with no timeout */
   return oldDlIndexPromise;
 }
 function getDlIndex() {
   if (fnDlIndex) return Promise.resolve(fnDlIndex);
-  if (!fnDlIndexPromise) fnDlIndexPromise = fnFetchResilient(DL_BASE + 'download-index.json', {}, 8000, 3, 'json').then(x => { fnDlIndex = x || {}; return fnDlIndex; }).catch(e => { fnDlIndexPromise = null; throw e; });
+  if (!fnDlIndexPromise) fnDlIndexPromise = fnDlFetch('download-index.json', 'json') /* FN-DL-NOVPN v1: worker proxy first, direct fallback */.then(x => { fnDlIndex = x || {}; return fnDlIndex; }).catch(e => { fnDlIndexPromise = null; throw e; });
   return fnDlIndexPromise;
 }
 let titleDlIndex = null, titleDlIndexPromise = null;
@@ -7097,7 +7149,7 @@ function getTitleIndex() {
      titles that have no IMDb code (download-title-index.json, keyed
      "movie:<tmdbId>" / "tv:<tmdbId>" -> {part, num, title, year, imdb_id}) */
   if (titleDlIndex) return Promise.resolve(titleDlIndex);
-  if (!titleDlIndexPromise) titleDlIndexPromise = fnFetchResilient(DL_BASE + 'download-title-index.json', {}, 8000, 3, 'json').then(x => { titleDlIndex = x || {}; return titleDlIndex; }).catch(e => { titleDlIndexPromise = null; throw e; });
+  if (!titleDlIndexPromise) titleDlIndexPromise = fnDlFetch('download-title-index.json', 'json') /* FN-DL-NOVPN v1: worker proxy first, direct fallback */.then(x => { titleDlIndex = x || {}; return titleDlIndex; }).catch(e => { titleDlIndexPromise = null; throw e; });
   return titleDlIndexPromise;
 }
 /* Search-index rows for the download-box title fallback (FN-DL-FALLBACK
@@ -7115,7 +7167,7 @@ function getDlSearchIndex() {
       return Promise.resolve(fnDlSearchIdx);
     }
   } catch (e) {}
-  if (!fnDlSearchIdxPromise) fnDlSearchIdxPromise = fetch(DL_BASE + 'search-index.json').then(r => { if (!r.ok) throw new Error('search index'); return r.json(); }).then(arr => {
+  if (!fnDlSearchIdxPromise) fnDlSearchIdxPromise = fnDlFetch('search-index.json', 'json').then(arr => { /* FN-DL-NOVPN v1: was a bare fetch() with no timeout */
     fnDlSearchIdx = (arr || []).map(e => ({ t: e[0], y: e[1], type: e[2], imdb: e[3], tmdb: e[4], part: e[5], old: e[6] }));
     return fnDlSearchIdx;
   }).catch(e => { fnDlSearchIdxPromise = null; throw e; });
@@ -7129,7 +7181,7 @@ function loadDlPart(part, which) {
   if (part === 'dn1' || part === 'dn2' || which === 'dn') {
     const n = (part === 'dn2' || Number(part) === 2) ? 2 : 1; /* string parts 'dn1'/'dn2' do not parse with Number() */
     if (dnDlParts[n]) return Promise.resolve(dnDlParts[n]);
-    return fetch(DL_BASE + 'dn/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+    return fnDlFetch('dn/archive-part-' + n + '.html', 'text')
       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); dnDlParts[n] = d; return d; });
   }
   /* FN-AO-SRC v1: archive.org part — the AO H3 file lives in
@@ -7138,7 +7190,7 @@ function loadDlPart(part, which) {
   if (part === 'ao' || which === 'ao') {
     const n = Number(part) >= 1 ? Number(part) : 1;
     if (aoDlParts[n]) return Promise.resolve(aoDlParts[n]);
-    return fetch(DL_BASE + 'ao/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+    return fnDlFetch('ao/archive-part-' + n + '.html', 'text')
       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); aoDlParts[n] = d; return d; });
   }
   /* FN-MBM-SRC v1: Mobomovies part — the MBM H3 file lives in
@@ -7147,7 +7199,7 @@ function loadDlPart(part, which) {
   if (part === 'mbm' || which === 'mbm') {
     const n = Number(part) >= 1 ? Number(part) : 1;
     if (mbmDlParts[n]) return Promise.resolve(mbmDlParts[n]);
-    return fetch(DL_BASE + 'mbm/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+    return fnDlFetch('mbm/archive-part-' + n + '.html', 'text')
       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); mbmDlParts[n] = d; return d; });
   }
   /* FN-SRM-SRC v1: SerMovieDown part — the SRM H3 file lives in
@@ -7156,7 +7208,7 @@ function loadDlPart(part, which) {
   if (part === 'srm' || which === 'srm') {
     const n = Number(part) >= 1 ? Number(part) : 1;
     if (srmDlParts[n]) return Promise.resolve(srmDlParts[n]);
-    return fetch(DL_BASE + 'srm/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+    return fnDlFetch('srm/archive-part-' + n + '.html', 'text')
       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); srmDlParts[n] = d; return d; });
   }
   /* FN-SM-SRC v1: Simba part — the SM H3 file lives in
@@ -7165,7 +7217,7 @@ function loadDlPart(part, which) {
   if (part === 'sm' || which === 'sm') {
     const n = Number(part) >= 1 ? Number(part) : 1;
     if (smDlParts[n]) return Promise.resolve(smDlParts[n]);
-    return fetch(DL_BASE + 'sm/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+    return fnDlFetch('sm/archive-part-' + n + '.html', 'text')
       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); smDlParts[n] = d; return d; });
   }
   /* FN-ML-SRC v1: Movielandz part — the ML H3 file lives in
@@ -7174,7 +7226,7 @@ function loadDlPart(part, which) {
   if (part === 'ml' || which === 'ml') {
     const n = Number(part) >= 1 ? Number(part) : 1;
     if (mlDlParts[n]) return Promise.resolve(mlDlParts[n]);
-    return fetch(DL_BASE + 'ml/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+    return fnDlFetch('ml/archive-part-' + n + '.html', 'text')
       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); mlDlParts[n] = d; return d; });
   }
   /* FN-BF-SRC v1: Babak Film part — the BF H3 file lives in
@@ -7183,7 +7235,7 @@ function loadDlPart(part, which) {
   if (part === 'bf' || which === 'bf') {
     const n = Number(part) >= 1 ? Number(part) : 1;
     if (bfDlParts[n]) return Promise.resolve(bfDlParts[n]);
-    return fetch(DL_BASE + 'bf/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+    return fnDlFetch('bf/archive-part-' + n + '.html', 'text')
       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); bfDlParts[n] = d; return d; });
   }
   /* FN-FH-SRC v1: FarsiHubz part — the FH H3 file lives in
@@ -7192,16 +7244,16 @@ function loadDlPart(part, which) {
   if (part === 'fh' || which === 'fh') {
     const n = Number(part) >= 1 ? Number(part) : 1;
     if (fhDlParts[n]) return Promise.resolve(fhDlParts[n]);
-    return fetch(DL_BASE + 'fh/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+    return fnDlFetch('fh/archive-part-' + n + '.html', 'text')
       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); fhDlParts[n] = d; return d; });
   }
-  /* FN-RZ-SRC v1: RezFlix part — the RZ H3 file lives in      download-data/rz/archive-part-1.html; the global download-index      maps RZ titles to part 'rz'. */   if (part === 'rz' || which === 'rz') {     const n = Number(part) >= 1 ? Number(part) : 1;     if (rzDlParts[n]) return Promise.resolve(rzDlParts[n]);     return fetch(DL_BASE + 'rz/archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); rzDlParts[n] = d; return d; });   }   const isOld = which === 'old';
+  /* FN-RZ-SRC v1: RezFlix part — the RZ H3 file lives in      download-data/rz/archive-part-1.html; the global download-index      maps RZ titles to part 'rz'. */   if (part === 'rz' || which === 'rz') {     const n = Number(part) >= 1 ? Number(part) : 1;     if (rzDlParts[n]) return Promise.resolve(rzDlParts[n]);     return fnDlFetch('rz/archive-part-' + n + '.html', 'text')       .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); rzDlParts[n] = d; return d; });   }   const isOld = which === 'old';
   const cache = isOld ? oldDlParts : fnDlParts;
   const base = isOld ? OLD_DL_BASE : DL_BASE;
   const maxPart = isOld ? 3 : 16;
   if (cache[part]) return Promise.resolve(cache[part]);
   const n = Number(part); if (!(n >= 1 && n <= maxPart)) return Promise.reject(new Error('archive part'));
-  return fetch(base + 'archive-part-' + n + '.html').then(r => { if (!r.ok) throw new Error('archive'); return r.text(); })
+  return fnDlFetch((isOld ? 'old/' : '') + 'archive-part-' + n + '.html', 'text') /* FN-DL-NOVPN v1: was a bare fetch() with no timeout */
     .then(t => { const d = new DOMParser().parseFromString(t, 'text/html'); cache[n] = d; return d; });
 }
 /* Merge two download records for the SAME title: every link from b whose
@@ -7220,25 +7272,44 @@ function mergeDlRecs(a, b) {
    'both' (or null when neither archive has it). */
 async function resolveDlRecord(imdbId, num) {
   if (imdbId) {
-    let main = null, extra = null, mainSrc = 'new'; /* FN-AO-SRC v1 */
-    try {
-      const index = await getDlIndex();
-      const part = index[imdbId];
-      if (part) {
-        const rec = recordFromArchive(await loadDlPart(part), imdbId);
-        if (dlRecHasLinks(rec)) { main = rec; mainSrc = (part === 'ao' ? 'ao' : part === 'mbm' ? 'mbm' : (part === 'dn1' || part === 'dn2') ? 'dn' : part === 'srm' ? 'srm' : part === 'sm' ? 'sm' : part === 'ml' ? 'ml' : part === 'bf' ? 'bf' : part === 'fh' ? 'fh' : part === 'rz' ? 'rz' : 'new'); } /* FN-MBM-SRC v1; FN-DN-SRC v1 adds dn; FN-SRM-SRC v1; FN-SM-SRC v1; FN-ML-SRC v1; FN-BF-SRC v1; FN-FH-SRC v1; FN-RZ-SRC v1 adds rz */
-      }
-    } catch (e) {}
-    try {
-      const oindex = await getOldDlIndex();
-      const opart = oindex[imdbId];
-      if (opart) {
-        const rec = recordFromArchive(await loadDlPart(opart, 'old'), imdbId);
-        if (dlRecHasLinks(rec)) extra = rec;
-      }
-    } catch (e) {}
-    if (main && extra) return { rec: mergeDlRecs(main, extra), src: 'both', hasDn: mainSrc === 'dn' }; /* FN-DN-SRC v1 */
-    if (main) return { rec: main, src: mainSrc, hasDn: mainSrc === 'dn' }; /* FN-DN-SRC v1 */
+    /* FN-DL-NOVPN v1 (2026-11-25): the new + old legs used to run
+       SEQUENTIALLY — three bare multi-MB fetches, any one stalling
+       froze the box. They now run in PARALLEL (Promise.allSettled) via
+       the proxied fetchers, and the old leg is SKIPPED when the new
+       record already has links (it only matters for old-only titles):
+       the old leg checks the shared flag after its index lands and
+       before fetching its 2.8 MB part file. When both legs do finish,
+       links still merge exactly as before. */
+    var shared = { main: null };
+    var srcOf = function (part) { return part === 'ao' ? 'ao' : part === 'mbm' ? 'mbm' : (part === 'dn1' || part === 'dn2') ? 'dn' : part === 'srm' ? 'srm' : part === 'sm' ? 'sm' : part === 'ml' ? 'ml' : part === 'bf' ? 'bf' : part === 'fh' ? 'fh' : part === 'rz' ? 'rz' : 'new'; };
+    var mainLeg = (async function () {
+      try {
+        const index = await getDlIndex();
+        const part = index[imdbId];
+        if (part) {
+          const rec = recordFromArchive(await loadDlPart(part), imdbId);
+          if (dlRecHasLinks(rec)) { var m = { rec: rec, src: srcOf(part) }; shared.main = m; return m; }
+        }
+      } catch (e) {}
+      return null;
+    })();
+    var oldLeg = (async function () {
+      try {
+        const oindex = await getOldDlIndex();
+        if (shared.main) return null; /* new archive already has links — old leg skipped */
+        const opart = oindex[imdbId];
+        if (opart) {
+          const rec = recordFromArchive(await loadDlPart(opart, 'old'), imdbId);
+          if (dlRecHasLinks(rec)) return rec;
+        }
+      } catch (e) {}
+      return null;
+    })();
+    var settled = await Promise.allSettled([mainLeg, oldLeg]);
+    var main = settled[0].status === 'fulfilled' ? settled[0].value : null;
+    var extra = settled[1].status === 'fulfilled' ? settled[1].value : null;
+    if (main && extra) return { rec: mergeDlRecs(main.rec, extra), src: 'both', hasDn: main.src === 'dn' };
+    if (main) return { rec: main.rec, src: main.src, hasDn: main.src === 'dn' };
     if (extra) return { rec: extra, src: 'old' };
     return null;
   }
@@ -8476,7 +8547,7 @@ function admDownload(url) {
 let fnExtIndex = null, fnExtIndexPromise = null;
 function getExtIndex() {
   if (fnExtIndex) return Promise.resolve(fnExtIndex);
-  if (!fnExtIndexPromise) fnExtIndexPromise = fetch(DL_BASE + 'ext/ext-index.json').then(r => { if (!r.ok) throw new Error('ext index'); return r.json(); }).then(x => { fnExtIndex = x || {}; return fnExtIndex; }).catch(e => { fnExtIndex = {}; return fnExtIndex; });
+  if (!fnExtIndexPromise) fnExtIndexPromise = fnDlFetch('ext/ext-index.json', 'json').then(x => { fnExtIndex = x || {}; return fnExtIndex; }).catch(e => { fnExtIndex = {}; return fnExtIndex; }); /* FN-DL-NOVPN v1: was a bare fetch() with no timeout */
   return fnExtIndexPromise;
 }
 async function fnExtDlHtml(tmdbKey) {
@@ -8521,12 +8592,21 @@ async function fnExtDlHtml(tmdbKey) {
    subtitles (the videos are NoSub); for an Iranian title the
    parenthetical is dropped, like fnExtDlHtml (RULE 2).
    ANTI-BUG (FN-DL-REWIRE v1, live 7ae8acdc): the box can render twice
-   on the same #d-dl-body; every fetch here has a timeout and every
+   on the same #d-dl-body; every fetch here goes through fnDlFetch
+   (worker proxy first, direct fallback, per-attempt timeouts) and every
    step is try/catch, so a slow or failed S1 load can NEVER leave the
-   box unopened — the caller falls back to the landing-page button. */
+   box unopened — the caller falls back to the landing-page button.
+   CORRECTED 2026-11-25 (FN-DL-NOVPN v1): before this fix the timeout
+   claim was false — loadDlPart / getOldDlIndex / getDlSearchIndex /
+   getExtIndex / getDualS1 were bare fetch() with no timeout. */
+/* FN-DL-NOVPN v1: DL_BASE files go through the worker proxy first
+   (fnDlFetch) — the direct fetch() here was the last bare fetch in the
+   S1 / info-tv decade loaders; the race still caps the wait at ms. */
 function fetchJsonTimeout(url, ms) {
+  var rel = (typeof DL_BASE !== 'undefined' && String(url || '').indexOf(DL_BASE) === 0) ? String(url).slice(DL_BASE.length) : null;
+  var p = rel ? fnDlFetch(rel, 'json') : fetch(url).then(function (r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); });
   return Promise.race([
-    fetch(url).then(function (r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); }),
+    p,
     new Promise(function (_, rej) { setTimeout(function () { rej(new Error('timeout')); }, ms || 6000); })
   ]);
 }
@@ -8547,7 +8627,7 @@ function getS1Decade(decade) {
 let fnDualS1 = null, fnDualS1Promise = null;
 function getDualS1() {
   if (fnDualS1) return Promise.resolve(fnDualS1);
-  if (!fnDualS1Promise) fnDualS1Promise = fetch(DL_BASE + 'ext/dual-s1.json').then(r => { if (!r.ok) throw new Error('dual s1'); return r.json(); }).then(x => { fnDualS1 = x || {}; return fnDualS1; }).catch(e => { fnDualS1 = {}; return fnDualS1; });
+  if (!fnDualS1Promise) fnDualS1Promise = fnDlFetch('ext/dual-s1.json', 'json').then(x => { fnDualS1 = x || {}; return fnDualS1; }).catch(e => { fnDualS1 = {}; return fnDualS1; }); /* FN-DL-NOVPN v1: was a bare fetch() with no timeout */
   return fnDualS1Promise;
 }
 async function getS1For(tmdbKey, year) {
@@ -8671,9 +8751,13 @@ async function fnExtOnlyBox(tmdbKey, posterUrl, fbTitle, fbYear, iranian) {
    episode has one quality, big «کپی لینک», ADM / browser rows, NO
    «پخش آنلاین» — Server 1 is download-only). ANTI-BUG (FN-DL-REWIRE
    v1): the box can render twice on the same #d-dl-body; every fetch
-   here has a timeout and every step is try/catch, so a slow or
+   here goes through fnDlFetch (worker proxy first, direct fallback,
+   per-attempt timeouts) and every step is try/catch, so a slow or
    failed S1 load can NEVER leave the box unopened — the caller
-   falls back to the landing-page button. */
+   falls back to the landing-page button.
+   CORRECTED 2026-11-25 (FN-DL-NOVPN v1): before this fix the timeout
+   claim was false — loadDlPart / getOldDlIndex / getDlSearchIndex /
+   getExtIndex / getDualS1 were bare fetch() with no timeout. */
 let fnS1TvDecadeCache = {};
 function getS1TvDecade(decade) {
   var key = String(decade);
@@ -9000,7 +9084,7 @@ async function fnS1TvExtOnlyBox(tmdbKey, posterUrl, fbTitle, fbYear, iranian) {
 let fnDnTrailerIndex = null, fnDnTrailerIndexPromise = null;
 function getDnTrailerIndex() {
   if (fnDnTrailerIndex) return Promise.resolve(fnDnTrailerIndex);
-  if (!fnDnTrailerIndexPromise) fnDnTrailerIndexPromise = fnFetchResilient(DL_BASE + 'dn/dn-trailer-index.json', {}, 8000, 3, 'json').then(x => { fnDnTrailerIndex = x || {}; return fnDnTrailerIndex; }).catch(e => { fnDnTrailerIndexPromise = null; return {}; });
+  if (!fnDnTrailerIndexPromise) fnDnTrailerIndexPromise = fnDlFetch('dn/dn-trailer-index.json', 'json') /* FN-DL-NOVPN v1: worker proxy first, direct fallback */.then(x => { fnDnTrailerIndex = x || {}; return fnDnTrailerIndex; }).catch(e => { fnDnTrailerIndexPromise = null; return {}; });
   return fnDnTrailerIndexPromise;
 }
 async function fnDnTrailerUrl(tmdbKey) {
@@ -9040,7 +9124,22 @@ function fnDtiCoordOk(coordRec, req) {
   if (cY !== null && rY !== null && cY !== rY) return false;
   return true;
 }
+/* FN-DL-NOVPN v1 (2026-11-25): hard 20 s deadline on the download box.
+   The resolve chain below can no longer spin the spinner forever: if
+   nothing has rendered after 20 s, the EXISTING error state is written
+   into #d-dl-body (same text as the catch branch) instead of the
+   eternal spinner. A late success still overwrites it. */
 async function loadDownloadBox(imdbId, token, fbTitle, fbYear, tmdbKey, posterUrl, iranian) {
+  const body0 = $('#d-dl-body'); if (!body0) return;
+  var done = false;
+  var timer = setTimeout(function () {
+    if (done || token !== detailToken) return;
+    var b = $('#d-dl-body'); if (b) b.innerHTML = '<div class="state">دریافت لینک‌های دانلود از آرشیو ممکن نشد؛ اتصال را بررسی و دوباره تلاش کنید.</div>';
+  }, 20000);
+  try { await loadDownloadBoxInner(imdbId, token, fbTitle, fbYear, tmdbKey, posterUrl, iranian); }
+  finally { done = true; clearTimeout(timer); }
+}
+async function loadDownloadBoxInner(imdbId, token, fbTitle, fbYear, tmdbKey, posterUrl, iranian) {
   const body = $('#d-dl-body'); if (!body) return;
   if (!imdbId && fbTitle) {
     /* the worker (TMDB external_ids) is blocked without VPN, so no IMDb
@@ -9359,9 +9458,6 @@ function fnPlayVisibleRows(rows) {
 async function fnPlayFetchPart(part) {
   if (FN_PLAY.parts[part]) return FN_PLAY.parts[part];
   /* v8.4: 8s cap — a stalled part fetch must never hang the list */
-  var ctl = new AbortController();
-  var to = setTimeout(function () { ctl.abort(); }, 8000);
-  try {
     /* FN-AO-SRC v1: the archive.org play-index lives in
        download-data/ao/play-index-ao.json (part 'ao').
        FN-MBM-SRC v1: the Mobomovies play-index lives in
@@ -9380,11 +9476,12 @@ async function fnPlayFetchPart(part) {
        download-data/fh/play-index-fh.json (part 'fh').
        FN-RZ-SRC v1: the RezFlix play-index lives in
        download-data/rz/play-index-rz.json (part 'rz'). */
-    var url = part === 'ao' ? DL_BASE + 'ao/play-index-ao.json' : part === 'mbm' ? DL_BASE + 'mbm/play-index-mbm.json' : part === 'srm' ? DL_BASE + 'srm/play-index-srm.json' : part === 'sm' ? DL_BASE + 'sm/play-index-sm.json' : part === 'ml' ? DL_BASE + 'ml/play-index-ml.json' : part === 'bf' ? DL_BASE + 'bf/play-index-bf.json' : part === 'fh' ? DL_BASE + 'fh/play-index-fh.json' : part === 'rz' ? DL_BASE + 'rz/play-index-rz.json' : (part === 'dn1' || part === 'dn2') ? DL_BASE + 'dn/play-index-dn.json' : DL_BASE + 'play-index-part-' + part + '.json';
-    var r = await fetch(url, { signal: ctl.signal });
-    if (!r.ok) throw new Error('play part');
-    var j = await r.json(); FN_PLAY.parts[part] = j; return j;
-  } finally { clearTimeout(to); }
+  var rel = part === 'ao' ? 'ao/play-index-ao.json' : part === 'mbm' ? 'mbm/play-index-mbm.json' : part === 'srm' ? 'srm/play-index-srm.json' : part === 'sm' ? 'sm/play-index-sm.json' : part === 'ml' ? 'ml/play-index-ml.json' : part === 'bf' ? 'bf/play-index-bf.json' : part === 'fh' ? 'fh/play-index-fh.json' : part === 'rz' ? 'rz/play-index-rz.json' : (part === 'dn1' || part === 'dn2') ? 'dn/play-index-dn.json' : 'play-index-part-' + part + '.json';
+  /* FN-DL-NOVPN v1: was a bare fetch() with only an 8 s AbortController
+     on the direct github.io URL — now via the worker proxy first
+     (fnDlFetch), fail-open to direct DL_BASE. */
+  var j = await fnDlFetch(rel, 'json');
+  FN_PLAY.parts[part] = j; return j;
 }
 /* ---------- old-archive (Donyaye Serial) MOVIES play-index (DS-OLD-MOVIES v1) ----------
    Same entry shape as the new play-index; the fallback in fnPlayResolve()
@@ -9394,14 +9491,13 @@ async function fnPlayFetchPart(part) {
 async function fnPlayOldFetchPart(part) {
   if (!FN_PLAY.oldParts) FN_PLAY.oldParts = {};
   if (FN_PLAY.oldParts[part]) return FN_PLAY.oldParts[part];
-  var r = await fetch(DL_BASE + 'play-index-old-part-' + part + '.json');
-  if (!r.ok) throw new Error('old play part');
-  var j = await r.json(); FN_PLAY.oldParts[part] = j; return j;
+  var j = await fnDlFetch('play-index-old-part-' + part + '.json', 'json'); /* FN-DL-NOVPN v1: was a bare fetch() with no timeout */
+  FN_PLAY.oldParts[part] = j; return j;
 }
 var fnPlayOldTitles = null, fnPlayOldTitlesPromise = null;
 function fnPlayOldFetchTitles() {
   if (fnPlayOldTitles) return Promise.resolve(fnPlayOldTitles);
-  if (!fnPlayOldTitlesPromise) fnPlayOldTitlesPromise = fetch(DL_BASE + 'play-index-old-titles.json').then(function (r) { if (!r.ok) throw new Error('old titles'); return r.json(); }).then(function (x) { fnPlayOldTitles = x || {}; return fnPlayOldTitles; });
+  if (!fnPlayOldTitlesPromise) fnPlayOldTitlesPromise = fnDlFetch('play-index-old-titles.json', 'json').then(function (x) { fnPlayOldTitles = x || {}; return fnPlayOldTitles; }).catch(function (e) { fnPlayOldTitlesPromise = null; throw e; }); /* FN-DL-NOVPN v1: was a bare fetch() with no timeout */
   return fnPlayOldTitlesPromise;
 }
 function fnPlayNormTitle(t) { return String(t || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
@@ -9418,9 +9514,8 @@ async function fnPlayH3NumByTitle(part, title, year) {
     var doc = null;
     if (typeof loadDlPart === 'function') doc = await loadDlPart(part);
     else {
-      var r = await fetch(DL_BASE + 'archive-part-' + part + '.html');
-      if (!r.ok) return null;
-      doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+      var t = await fnDlFetch('archive-part-' + part + '.html', 'text'); /* FN-DL-NOVPN v1: was a bare fetch() with no timeout */
+      doc = new DOMParser().parseFromString(t, 'text/html');
     }
     if (!doc) return null;
     var needle = normTitle(title);
@@ -9710,7 +9805,11 @@ async function openPlayListOrPlayer(o) {
     var hasDl = false;
     try {
       if (typeof fnDlTitleFallback === 'function') {
-        var dl = await fnDlTitleFallback(ctx.imdbId, ctx.tmdbKey, ctx.title, ctx.year);
+        /* FN-DL-NOVPN v1: the fallback had NO timeout — a stalled
+           search-index / part fetch spun the box forever. Capped at 8 s;
+           on expiry the box falls through to the external player, as if
+           the title had no download record. */
+        var dl = await Promise.race([fnDlTitleFallback(ctx.imdbId, ctx.tmdbKey, ctx.title, ctx.year), fnPlayTimeout(8000)]);
         hasDl = !!(dl && dl.rec);
       }
     } catch (e2) { hasDl = false; }
