@@ -12755,7 +12755,8 @@ const sxT0 = Date.now();
 function sxHideSplash() { const s = $('#splash'); if (s && !s.classList.contains('off')) { s.classList.add('off'); setTimeout(() => { if (s.parentNode) s.remove(); }, 700); } }
 const sxSplashTimer = setInterval(() => {
   const ready = document.querySelector('#home-rails .rail');
-  if ((ready && Date.now() - sxT0 > 1150) || Date.now() - sxT0 > 4500) { clearInterval(sxSplashTimer); sxHideSplash(); }
+  /* FN-NO-VPN v1 (Group E): no forced wait — hide the moment the home rails exist. The 4500 ms cap is only a safety net for a home that never paints (then hiding reveals the error state instead of a stuck splash). */
+  if (ready || Date.now() - sxT0 > 4500) { clearInterval(sxSplashTimer); sxHideSplash(); }
 }, 250);
 
 /* ---------- entity overlay (person / company / collection) ---------- */
