@@ -7254,9 +7254,9 @@ function dlTilesHtml(rec, opts) {
     + (totalMB ? '<span class="fn-dl-tot"><b>' + faSize(fmtTotalMB(totalMB)) + '</b><span>حجم مجموع</span></span>' : '')
     + '<button class="fn-dl-copyall" data-dl-copyall>' + (isSeries ? 'کپی همه قسمت‌ها' : 'کپی همه لینک‌ها') + '</button>'
     + '</div>'
-    /* FN-DN-VPN v1 — one short line under the header, only for DN
-       boxes: some DN links need VPN off, some on. */
-    + (o.hasDn ? '<div class="fn-dn-hint">اگه دانلود نشد VPN رو خاموش کنین، اگه خاموش بود و نشد روشن کنین</div>' : '');
+    /* FN-DN-VPN v1 — one short line under the header, only for DN boxes.
+       FN-NO-VPN v1: VPN-off only — the old "turn it on" clause is gone (no-split rule: nobody toggles; a DN link that truly needs VPN on is a per-spot call for Alireza, not a hint here). */
+    + (o.hasDn ? '<div class="fn-dn-hint">اگه دانلود نشد VPN رو خاموش کنین</div>' : '');
   /* series copy-all: quality chooser (filled in wireDlTiles) */
   if (isSeries) {
     out += '<div class="fn-dl-cabox" hidden><div class="fn-dl-ca-title"></div><div class="fn-dl-ca-chips"></div><button class="fn-dl-ca-close">بستن</button></div>';
@@ -9462,10 +9462,10 @@ function fnPlayRenderList() {
   var entry = FN_PLAY.entry, ctx = FN_PLAY.ctx;
   var body = $('#pl-body'), seasonBox = $('#pl-season');
   var joined = fnPlayVisibleRows(fnPlayJoined(entry)); // FN-CAM-HIDE-PLAY v1
-  /* FN-DN-SRC v1 — the VPN hint shows when the list holds DarkNama
-     rows (encoder 'darknama'): some DN links need VPN off, some on. */
+  /* FN-DN-SRC v1 — the VPN hint shows when the list holds DarkNama rows (encoder 'darknama').
+     FN-NO-VPN v1: VPN-off only (no-split rule — nobody toggles). */
   var hasDnPlay = joined.some(function (p) { return String(p.encoder || '').toLowerCase() === 'darknama'; });
-  var dnPlayHint = hasDnPlay ? '<div class="pl-dn-hint">اگه پخش نشد VPN رو خاموش کنین، اگه خاموشه روشن کنین</div>' : '';
+  var dnPlayHint = hasDnPlay ? '<div class="pl-dn-hint">اگه پخش نشد VPN رو خاموش کنین</div>' : '';
   if (ctx.type === 'tv') {
     var opts = [], seen = {};
     joined.forEach(function (p) {
@@ -11264,7 +11264,8 @@ async function openSharedTitle(type, id, play, season, episode) {
       }
     } catch (e) {}
   }
-  openPlayer({ id, type, item, imdbId, season: season || 1, episode: episode || 1 });
+  /* FN-NO-VPN v1: a shared play link takes the same path as the Play button — internal direct links first, foreign embed only when no internal rows exist. */
+  openPlayListOrPlayer({ id, type, item, imdbId, season: season || 1, episode: episode || 1 });
 }
 /* open a shared live-TV link on the channel it names */
 async function openSharedChannel(name, url) {
