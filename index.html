@@ -12326,9 +12326,11 @@ async function dlaPrePump() {
   DLA_PRE.pumping = true;
   try {
     for (let qi = 0; qi < DLA_PRE.order.length; qi++) {
+      if (window.__dlaIndexOk) break;   /* FN-DLA-INDEX v1: the index is the source now — no part refetch */
       const step = DLA_PRE.order[qi];
       if (DLA_PRE.takeover) await dlaPreWaitTakeover();
       await dlaPreWaitIdle();
+      if (window.__dlaIndexOk) break;   /* FN-DLA-INDEX v1: re-check AFTER the idle wait — the index may have loaded while we waited */
       DLA_PRE.current = dlaPreKey(step.src, step.n);
       try { await dlaPreLoadPart(step); } catch (e) { /* fail-open: next pass / loader */ }
       DLA_PRE.current = '';
@@ -12351,6 +12353,43 @@ async function dlaPreStart() {
   } catch (e) { /* the preload never breaks the page */ }
 }
 
+/* ---------- FN-DLA-INDEX v1: one-file index fast path ----------
+   The download archive used to fetch ~29 part files (~70 MB of HTML)
+   one by one and parse them on the main thread — on a flaky connection
+   the loader aborts after 40 s with only the first few thousand
+   titles. The Rust-built columnar index (download-data/dla-index-vN.json,
+   one fetch, ~1.5 MB) carries every field the section needs, in the
+   same order the part loader produces, including the precomputed
+   quality/codec masks (qm/cm) and the old-archive merge flags
+   (hasOld/oldPart). The manifest (dla-index-version.json, no-store)
+   names the current version; a rebuild ships a NEW versioned file, so
+   a cached old index can never shadow fresh data. Any failure here
+   (manifest/index fetch, count mismatch, bad column) falls through to
+   the original part loop below — unchanged. */
+async function dlaFetchJsonTimeout(url, ms, noStore) {
+  const c = new AbortController();
+  const t = setTimeout(function () { c.abort(); }, ms);
+  try {
+    const r = await fetch(url, { signal: c.signal, cache: noStore ? 'no-store' : 'default' });
+    if (!r.ok) throw new Error('dla-index http ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+async function dlaLoadIndex() {
+  const man = await dlaFetchJsonTimeout('download-data/dla-index-version.json', 15000, true);
+  if (!man || !man.file || !man.count || typeof man.count !== 'number') throw new Error('dla-index-manifest');
+  const idx = await dlaFetchJsonTimeout('download-data/' + man.file, 60000, false);
+  if (!idx || idx.count !== man.count || !Array.isArray(idx.title) || idx.title.length !== idx.count) throw new Error('dla-index-count');
+  const cols = ['imdb', 'num', 'rate', 'votes', 'year', 'type', 'links', 'flags', 'hasOld', 'oldPart', 'part', 'src', 'qm', 'cm'];
+  for (let k = 0; k < cols.length; k++) {
+    if (!Array.isArray(idx[cols[k]]) || idx[cols[k]].length !== idx.count) throw new Error('dla-index-col ' + cols[k]);
+  }
+  const entries = [];
+  for (let i = 0; i < idx.count; i++) {
+    entries.push({ title: idx.title[i], imdb: idx.imdb[i], num: idx.num[i], rate: idx.rate[i], votes: idx.votes[i], year: idx.year[i], type: idx.type[i] ? 'tv' : 'movie', links: idx.links[i], soft: !!(idx.flags[i] & 1), dub: !!(idx.flags[i] & 2), nosub: !!(idx.flags[i] & 4), hasOld: !!idx.hasOld[i], oldPart: idx.oldPart[i], part: idx.part[i], src: idx.src[i], qm: idx.qm[i], cm: idx.cm[i] });
+  }
+  return entries;
+}
 async function initDlArchive() {
   /* re-entering the section: the entries and every resolved
      country/year stay exactly where they were (in memory, backed by
@@ -12370,6 +12409,22 @@ async function initDlArchive() {
      the background pump waits instead of fetching the same parts. */
   DLA_PRE.takeover = true;
   renderDlaFilters();   /* filters render greyed-out while loading (only type stays active) */
+  /* FN-DLA-INDEX v1: try the one-file index first — on success the
+     part loop below is skipped entirely. Any failure falls through
+     to the original part loop, unchanged. */
+  try {
+    const idxEntries = await dlaLoadIndex();
+    if (idxEntries && idxEntries.length) {
+      dlaEntries = idxEntries;
+      dlaLoading = false; dlaLoaded = true;
+      window.__dlaIndexOk = true;   /* stop the background preload pump */
+      DLA_PRE.takeover = false;
+      renderDlaFilters();   /* full list arrived — all filters become active */
+      dlaHydrateCache();   /* restore every country/year resolved in earlier visits before first paint */
+      renderDlaList();
+      return;
+    }
+  } catch (e) { /* fall through to the part loop below */ }
   const body = $('#dla-body');
   const entries = [];
   const entryByImdb = new Map();
@@ -12506,6 +12561,18 @@ function dlaTopSort(a, b) {
    encoders and are left out. Filenames come from the entry's own
    _hrefs (every link URL of its H3 record, old archive included). */
 function dlaEncoders(e) {
+  /* FN-DLA-INDEX v1: index-built entries carry precomputed quality /
+     codec masks (qm/cm) from the merged URL set — same tokens, same
+     order as the _hrefs path below. */
+  if (e.qm != null && e.cm != null) {
+    const quals = ['2160', '1080', '720', '480', '360'].filter(function (q, i) { return (e.qm >> i) & 1; });
+    const codecs = [];
+    if (e.cm & 1) codecs.push('x265');
+    if (e.cm & 2) codecs.push('x264');
+    if ((e.cm & 4) && !(e.cm & 1)) codecs.push('HEVC');
+    if (e.cm & 8) codecs.push('10bit');
+    return { quals: quals, codecs: codecs };
+  }
   const hrefs = e._hrefs ? Array.from(e._hrefs) : [];
   const text = hrefs.join(' ').toLowerCase();
   const quals = ['2160', '1080', '720', '480', '360'].filter(q => new RegExp('\\b' + q + 'p\\b').test(text));
