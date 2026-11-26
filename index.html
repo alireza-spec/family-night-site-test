@@ -12353,7 +12353,7 @@ async function dlaPreStart() {
   } catch (e) { /* the preload never breaks the page */ }
 }
 
-/* ---------- FN-DLA-INDEX v1: one-file index fast path ----------
+/* ---------- FN-DLA-INDEX v3: one-file index fast path ----------
    The download archive used to fetch ~29 part files (~70 MB of HTML)
    one by one and parse them on the main thread — on a flaky connection
    the loader aborts after 40 s with only the first few thousand
@@ -12375,18 +12375,29 @@ async function dlaFetchJsonTimeout(url, ms, noStore) {
     return await r.json();
   } finally { clearTimeout(t); }
 }
+function dlaPosterHtml(e) {
+  /* FN-DLA-INDEX v3: the poster comes from the index — render the real
+     <img> at first paint instead of the first-letter placeholder. The
+     URL uses the page's own IMG() helper (worker /img/ proxy, w185).
+     No poster in the index → the letter placeholder, exactly as before. */
+  if (e.poster && typeof IMG === 'function') {
+    return '<span class="dla-poster"><img loading="lazy" decoding="async" src="' + esc(IMG(e.poster, 'w185')) + '" alt="' + esc(e.title || '') + '"></span>';
+  }
+  return '<span class="dla-poster"><span class="noimg">' + esc((e.title || '?').trim().charAt(0)) + '</span></span>';
+}
 async function dlaLoadIndex() {
   const man = await dlaFetchJsonTimeout('download-data/dla-index-version.json', 15000, true);
   if (!man || !man.file || !man.count || typeof man.count !== 'number') throw new Error('dla-index-manifest');
   const idx = await dlaFetchJsonTimeout('download-data/' + man.file, 60000, false);
   if (!idx || idx.count !== man.count || !Array.isArray(idx.title) || idx.title.length !== idx.count) throw new Error('dla-index-count');
-  const cols = ['imdb', 'num', 'rate', 'votes', 'year', 'type', 'links', 'flags', 'hasOld', 'oldPart', 'part', 'src', 'qm', 'cm'];
+  if (idx.v !== 2) throw new Error('dla-index-format');
+  const cols = ['imdb', 'num', 'rate', 'votes', 'year', 'type', 'links', 'flags', 'hasOld', 'oldPart', 'part', 'src', 'qm', 'cm', 'cc', 'po', 'tm'];
   for (let k = 0; k < cols.length; k++) {
     if (!Array.isArray(idx[cols[k]]) || idx[cols[k]].length !== idx.count) throw new Error('dla-index-col ' + cols[k]);
   }
   const entries = [];
   for (let i = 0; i < idx.count; i++) {
-    entries.push({ title: idx.title[i], imdb: idx.imdb[i], num: idx.num[i], rate: idx.rate[i], votes: idx.votes[i], year: idx.year[i], type: idx.type[i] ? 'tv' : 'movie', links: idx.links[i], soft: !!(idx.flags[i] & 1), dub: !!(idx.flags[i] & 2), nosub: !!(idx.flags[i] & 4), hasOld: !!idx.hasOld[i], oldPart: idx.oldPart[i], part: idx.part[i], src: idx.src[i], qm: idx.qm[i], cm: idx.cm[i] });
+    entries.push({ title: idx.title[i], imdb: idx.imdb[i], num: idx.num[i], rate: idx.rate[i], votes: idx.votes[i], year: idx.year[i], type: idx.type[i] ? 'tv' : 'movie', links: idx.links[i], soft: !!(idx.flags[i] & 1), dub: !!(idx.flags[i] & 2), nosub: !!(idx.flags[i] & 4), hasOld: !!idx.hasOld[i], oldPart: idx.oldPart[i], part: idx.part[i], src: idx.src[i], qm: idx.qm[i], cm: idx.cm[i], cc: idx.cc[i], poster: idx.po[i], tm: idx.tm[i] });
   }
   return entries;
 }
@@ -12409,13 +12420,14 @@ async function initDlArchive() {
      the background pump waits instead of fetching the same parts. */
   DLA_PRE.takeover = true;
   renderDlaFilters();   /* filters render greyed-out while loading (only type stays active) */
-  /* FN-DLA-INDEX v1: try the one-file index first — on success the
+  /* FN-DLA-INDEX v3: try the one-file index first — on success the
      part loop below is skipped entirely. Any failure falls through
      to the original part loop, unchanged. */
   try {
     const idxEntries = await dlaLoadIndex();
     if (idxEntries && idxEntries.length) {
       dlaEntries = idxEntries;
+      window.__dlaIndexCcKnown = idxEntries.filter(function (e) { return !!e.cc; }).length;   /* FN-DLA-INDEX v3: final resolved-country count for the note */
       dlaLoading = false; dlaLoaded = true;
       window.__dlaIndexOk = true;   /* stop the background preload pump */
       DLA_PRE.takeover = false;
@@ -12655,6 +12667,31 @@ function dlaEnrichEntry(e) {
   if (e._tmdbP) return e._tmdbP;
   e._tmdbP = (async () => {
     let hit = null, kind = e.type === 'tv' ? 'tv' : 'movie';
+    /* FN-DLA-INDEX v3: poster + TMDB id come from the index — no
+       find/search when we have them. A movie with a Latin title and a
+       year needs nothing more; otherwise one direct details call fills
+       the English title/year (movie) or the dates/seasons (series). */
+    if (e.tm) {
+      const hasLatin = /[A-Za-z]/.test(e.title || '');
+      if (kind === 'movie' && e.poster && hasLatin && e.year) {
+        e._tmdb = { poster: e.poster, kind: kind, enTitle: '' };
+        return e._tmdb;
+      }
+      try {
+        if (kind === 'tv') {
+          const d = await tmdb('tv/' + e.tm, {});
+          const out = { poster: e.poster || '', kind: kind, enTitle: '' };
+          if (d) { out.firstAir = d.first_air_date || ''; out.lastAir = d.last_air_date || ''; out.status = d.status || ''; out.seasons = d.number_of_seasons || 0; out.type = d.type || ''; out.isMini = d.type === 'Miniseries'; }
+          e._tmdb = out;
+          return out;
+        }
+        const d = await tmdb('movie/' + e.tm, {}, 'en-US');
+        const out = { poster: e.poster || '', kind: kind, enTitle: (d && d.title) || '', year: (d && d.release_date) ? String(d.release_date).slice(0, 4) : '' };
+        e._tmdb = out;
+        return out;
+      } catch (err) { /* fall through to the find/search path below */ }
+    }
+
     try {
       if (e.imdb) {
         const f = await tmdb('find/' + e.imdb, { external_source: 'imdb_id' }, 'en-US');
@@ -12820,7 +12857,7 @@ function dlaHydrateCache() {
   if (!cache.size || !dlaEntries) return;
   dlaEntries.forEach(e => {
     const v = cache.get(e.imdb);
-    if (v) { e.cc = v[0] || ''; if (!e.year && v[1]) e.year = v[1]; if (v[2]) e.yearRange = v[2]; if (v[3]) e.seasons = v[3]; if (v[4]) e.votes = v[4]; }
+    if (v) { if (!e.cc) e.cc = v[0] || ''; if (!e.year && v[1]) e.year = v[1]; if (v[2]) e.yearRange = v[2]; if (v[3]) e.seasons = v[3]; if (v[4]) e.votes = v[4]; }
   });
 }
 let dlaEnrichRunning = false, dlaEnrichDone = 0, dlaEnrichFailed = false, dlaEnrichFails = 0;
@@ -12866,6 +12903,15 @@ function dlaPaintFnote() {
   const el = $('#dla-fnote'); if (!el) return;
   if (!dlaEntries) { el.style.display = 'none'; return; }
   const total = dlaEntries.length;
+  /* FN-DLA-INDEX v3: the index carries the country for every title it
+     could resolve — the count is final at first render, it never creeps.
+     Show the true resolved count once; hide only when everything is known. */
+  if (window.__dlaIndexOk && typeof window.__dlaIndexCcKnown === 'number') {
+    if (window.__dlaIndexCcKnown >= total) { el.style.display = 'none'; return; }
+    el.style.display = '';
+    el.textContent = 'کشور سازندهٔ ' + window.__dlaIndexCcKnown.toLocaleString('fa-IR') + ' عنوان از ' + total.toLocaleString('fa-IR') + ' عنوان مشخص شده است؛ فیلتر کشور روی عناوین مشخص‌شده اعمال می‌شود.';
+    return;
+  }
   if (dlaEnrichDone >= total) { el.style.display = 'none'; return; }
   el.style.display = '';
   el.textContent = 'کشور سازندهٔ ' + dlaEnrichDone.toLocaleString('fa-IR') + ' عنوان از ' + total.toLocaleString('fa-IR') + ' عنوان مشخص شده و بقیه به‌تدریج تکمیل می‌شود؛ فیلتر کشور روی عناوین مشخص‌شده اعمال می‌شود.';
@@ -12963,7 +13009,7 @@ function renderDlaList() {
     const fa = e.fa || titleFaCache.get(e.title) || '';
     const ver = dlaStatus(e);
     return '<div class="dla-row" data-dla="' + i + '" data-dla-idx="' + i + '" role="button" tabindex="0">'
-    + '<span class="dla-poster"><span class="noimg">' + esc((e.title || '?').trim().charAt(0)) + '</span></span>'
+    + dlaPosterHtml(e)
     + '<span class="inf"><b data-fa-done="1">' + esc(dlaTitleLine(e)) + '</b>'
     + '<span class="dla-sub"><span class="dla-fa" data-dla-fa="' + i + '">' + esc(fa) + '</span><span class="dla-ver">' + (fa && ver ? ' · ' : '') + esc(ver) + '</span></span>'
     + '<span class="dla-enc">' + dlaEncHtml(e) + '</span></span>'
